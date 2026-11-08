@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
-import { getCurrentStaff, canManageGame } from "@/lib/auth";
-import { connectMongo, logAudit } from "@/lib/db";
+import { getCurrentStaff, canManageGame, canManageSystem } from "@/lib/auth";
+import { connectMongo, logAudit, toggleFreezeGame } from "@/lib/db";
 import {
   GameModel,
   TeamModel,
@@ -106,6 +106,33 @@ export async function POST(req: Request) {
           { success: false, error: "Game is already completed" },
           { status: 400 }
         );
+      }
+
+      // Security check: Game Master can ONLY grant clues to the team currently playing at their game station
+      if (staff.role === "GAME_MASTER" && winnerTeamId) {
+        const isTeamPlayingAtStation = conn
+          ? await GameAssignmentModel.findOne({
+              gameId: targetGame._id.toString(),
+              teamId: winnerTeamId,
+              round: currentRound,
+            })
+          : store?.assignments.find(
+              (a: any) =>
+                (a.gameId === gameId || a.gameId === targetGame._id) &&
+                a.teamId === winnerTeamId &&
+                a.round === currentRound
+            );
+
+        if (!isTeamPlayingAtStation) {
+          return NextResponse.json(
+            {
+              success: false,
+              error:
+                "Permission denied: As a Game Master, you can only grant clues to the team currently playing your station in the active round.",
+            },
+            { status: 403 }
+          );
+        }
       }
 
       const now = new Date();
@@ -229,6 +256,23 @@ export async function POST(req: Request) {
         success: true,
         message: "Game status reset to pending",
         game: targetGame,
+      });
+    }
+
+    // 4. TOGGLE FREEZE / UNFREEZE (Admin only)
+    if (action === "TOGGLE_FREEZE") {
+      if (!canManageSystem(staff)) {
+        return NextResponse.json(
+          { success: false, error: "Only Admins can freeze or unfreeze games" },
+          { status: 403 }
+        );
+      }
+
+      const updatedGame = await toggleFreezeGame(gameId, staff.email);
+      return NextResponse.json({
+        success: true,
+        message: `Station ${updatedGame.name} is now ${updatedGame.inRotation ? "Unfrozen (Active)" : "Frozen (Excluded from rotation)"}`,
+        game: updatedGame,
       });
     }
 

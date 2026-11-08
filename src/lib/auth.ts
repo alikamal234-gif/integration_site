@@ -11,6 +11,7 @@ export interface TokenPayload {
   email: string;
   role: Role;
   assignedGameIds: string[];
+  assignedGameId?: string | null;
 }
 
 export function signStaffToken(payload: TokenPayload): string {
@@ -55,7 +56,8 @@ export function canManageGame(staff: TokenPayload, gameId: string): boolean {
   if (staff.role === "SUPER_ADMIN" || staff.role === "ADMIN") {
     return true;
   }
-  return staff.assignedGameIds.includes(gameId);
+  const assigned = staff.assignedGameId || (staff.assignedGameIds && staff.assignedGameIds[0]);
+  return assigned === gameId || (staff.assignedGameIds && staff.assignedGameIds.includes(gameId));
 }
 
 export function canManageSystem(staff: TokenPayload): boolean {

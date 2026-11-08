@@ -70,6 +70,7 @@ export interface IStaff {
   passwordHash: string;
   role: Role;
   assignedGameIds: string[];
+  assignedGameId?: string | null;
 }
 
 export interface IAuditLog {
@@ -178,6 +179,7 @@ const StaffSchema = new Schema<IStaff & Document>({
     required: true,
   },
   assignedGameIds: [{ type: String }],
+  assignedGameId: { type: String, default: null },
 });
 
 const AuditLogSchema = new Schema<IAuditLog & Document>({

@@ -23,7 +23,7 @@ import {
   INITIAL_CLUES_POOL,
   SAMPLE_STUDENTS,
 } from "./initialData";
-import { balanceTeams, generateStationRotation } from "./rotation";
+import { balanceTeams, generateStationRotation, parseStudentCSV } from "./rotation";
 
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/youcode_integration_platform";
 
@@ -441,12 +441,65 @@ export async function getStaffDashboardData(staffEmail?: string) {
 
   const currentUser = staffList.find((s) => s.email === staffEmail);
 
+  // If user is a Game Master: enforce strict visual isolation
+  // "each game master has a visual of only the current teams playing his game not all the players so he can only grant clues to the teams playing his game"
+  if (currentUser && currentUser.role === "GAME_MASTER") {
+    const assignedGameId = currentUser.assignedGameId || (currentUser.assignedGameIds && currentUser.assignedGameIds[0]);
+    const myGame = games.find(
+      (g) => g._id?.toString() === assignedGameId || `game_${g.gameNumber}` === assignedGameId
+    );
+
+    const activeRound = eventState.currentRound || 1;
+
+    // Find the current assignments for this GM's station for the active round
+    const currentAssignmentsForMyGame = assignments.filter(
+      (a) =>
+        (a.gameId?.toString() === assignedGameId || a.gameId?.toString() === myGame?._id?.toString()) &&
+        a.round === activeRound
+    );
+
+    const currentTeamIds = new Set(
+      currentAssignmentsForMyGame
+        .map((a) => a.teamId?.toString())
+        .filter((id): id is string => Boolean(id))
+    );
+    const visibleTeams = teams.filter((t) =>
+      t._id ? currentTeamIds.has(t._id.toString()) : false
+    );
+
+    const myClues = clues.filter(
+      (c) =>
+        c.gameId?.toString() === assignedGameId ||
+        c.gameId?.toString() === myGame?._id?.toString()
+    );
+
+    return {
+      currentUser,
+      teams: visibleTeams, // ONLY current teams playing at GM's station!
+      games: myGame ? [myGame] : [], // ONLY GM's single assigned game!
+      eventState: {
+        phase: eventState.phase,
+        currentRound: eventState.currentRound,
+        totalRounds: eventState.totalRounds,
+        cluesRevealed: eventState.cluesRevealed,
+        roundStartedAt: eventState.roundStartedAt,
+        roundDurationMinutes: eventState.roundDurationMinutes,
+      },
+      clues: myClues,
+      assignments: currentAssignmentsForMyGame,
+      staffList: [], // Hidden from Game Masters
+      auditLogs: [], // Hidden from Game Masters
+      students: [], // Hidden from Game Masters (cannot see all players)
+    };
+  }
+
+  // Global Admin (SUPER_ADMIN / ADMIN) gets full visual and control of everything
   return {
     currentUser,
     teams,
     games,
     eventState,
-    clues, // Staff can view clues configuration
+    clues,
     assignments,
     staffList,
     auditLogs,
@@ -475,4 +528,265 @@ export async function logAudit(adminEmail: string, action: string, details: stri
       createdAt: new Date(),
     });
   }
+}
+
+// Admin: Create Game Master / Staff Account (each GM assigned to exactly ONE game)
+export async function createStaffAccount(data: {
+  name: string;
+  email: string;
+  password: string;
+  assignedGameId: string;
+  role?: "ADMIN" | "GAME_MASTER";
+  adminEmail: string;
+}) {
+  const conn = await connectMongo();
+  const store = getInMemoryStore();
+
+  const hashedPassword = await bcrypt.hash(data.password, 10);
+  const role = data.role || "GAME_MASTER";
+  const assignedGameIds = data.assignedGameId ? [data.assignedGameId] : [];
+
+  if (conn) {
+    const existing = await StaffModel.findOne({ email: data.email.toLowerCase() });
+    if (existing) {
+      throw new Error(`An account with email ${data.email} already exists`);
+    }
+
+    const newStaff = await StaffModel.create({
+      name: data.name,
+      email: data.email.toLowerCase(),
+      passwordHash: hashedPassword,
+      role,
+      assignedGameIds,
+      assignedGameId: data.assignedGameId,
+    });
+
+    // Also link GM to Game document
+    if (data.assignedGameId) {
+      await GameModel.findByIdAndUpdate(data.assignedGameId, {
+        $addToSet: { masterIds: newStaff._id.toString() },
+      });
+    }
+
+    await logAudit(
+      data.adminEmail,
+      "CREATE_STAFF_ACCOUNT",
+      `Created ${role} account for ${data.name} (${data.email}) assigned to Station ${data.assignedGameId}`
+    );
+
+    return newStaff;
+  } else {
+    const existing = store.staff.find((s) => s.email.toLowerCase() === data.email.toLowerCase());
+    if (existing) {
+      throw new Error(`An account with email ${data.email} already exists`);
+    }
+
+    const newStaff: IStaff = {
+      _id: `staff_${Date.now()}`,
+      name: data.name,
+      email: data.email.toLowerCase(),
+      passwordHash: hashedPassword,
+      role,
+      assignedGameIds,
+      assignedGameId: data.assignedGameId,
+    };
+    store.staff.push(newStaff);
+
+    const game = store.games.find((g) => g._id === data.assignedGameId);
+    if (game && !game.masterIds.includes(newStaff._id!)) {
+      game.masterIds.push(newStaff._id!);
+    }
+
+    await logAudit(
+      data.adminEmail,
+      "CREATE_STAFF_ACCOUNT",
+      `Created ${role} account for ${data.name} (${data.email}) assigned to Station ${data.assignedGameId}`
+    );
+
+    return newStaff;
+  }
+}
+
+// Admin: Update/Reassign Staff Account
+export async function updateStaffAccount(
+  staffId: string,
+  data: {
+    name?: string;
+    email?: string;
+    password?: string;
+    assignedGameId?: string;
+    role?: "ADMIN" | "GAME_MASTER";
+    adminEmail: string;
+  }
+) {
+  const conn = await connectMongo();
+  const store = getInMemoryStore();
+
+  const updates: any = {};
+  if (data.name) updates.name = data.name;
+  if (data.email) updates.email = data.email.toLowerCase();
+  if (data.role) updates.role = data.role;
+  if (data.assignedGameId) {
+    updates.assignedGameId = data.assignedGameId;
+    updates.assignedGameIds = [data.assignedGameId];
+  }
+  if (data.password) {
+    updates.passwordHash = await bcrypt.hash(data.password, 10);
+  }
+
+  if (conn) {
+    await StaffModel.findByIdAndUpdate(staffId, updates);
+    if (data.assignedGameId) {
+      await GameModel.findByIdAndUpdate(data.assignedGameId, {
+        $addToSet: { masterIds: staffId },
+      });
+    }
+  } else {
+    const staff = store.staff.find((s) => s._id === staffId);
+    if (staff) {
+      Object.assign(staff, updates);
+    }
+  }
+
+  await logAudit(
+    data.adminEmail,
+    "UPDATE_STAFF_ACCOUNT",
+    `Updated staff ${staffId} (Assigned game: ${data.assignedGameId || "unchanged"})`
+  );
+}
+
+// Admin: Delete Staff Account
+export async function deleteStaffAccount(staffId: string, adminEmail: string) {
+  const conn = await connectMongo();
+  const store = getInMemoryStore();
+
+  if (conn) {
+    await StaffModel.findByIdAndDelete(staffId);
+  } else {
+    store.staff = store.staff.filter((s) => s._id !== staffId);
+  }
+
+  await logAudit(
+    adminEmail,
+    "DELETE_STAFF_ACCOUNT",
+    `Deleted staff account ${staffId}`
+  );
+}
+
+// Admin: Toggle Freeze / Unfreeze Game (removes/adds game from active rotation pool)
+export async function toggleFreezeGame(gameId: string, adminEmail: string) {
+  const conn = await connectMongo();
+  const store = getInMemoryStore();
+
+  let targetGame: any = null;
+  let allGames: IGame[] = [];
+  let allTeams: ITeam[] = [];
+  let currentRound = 1;
+
+  if (conn) {
+    targetGame = await GameModel.findById(gameId);
+    if (!targetGame) throw new Error("Game not found");
+
+    targetGame.inRotation = !targetGame.inRotation;
+    await targetGame.save();
+
+    allGames = (await GameModel.find({}).lean()) as unknown as IGame[];
+    allTeams = (await TeamModel.find({}).lean()) as unknown as ITeam[];
+    const state = await EventStateModel.findOne({}).lean();
+    if (state) currentRound = state.currentRound;
+
+    // Recalculate remaining rotation assignments without the frozen game
+    const newAssignments = generateStationRotation(allTeams, allGames, 9);
+    // Delete future assignments for rounds >= currentRound and re-insert
+    await GameAssignmentModel.deleteMany({ round: { $gte: currentRound } });
+    const pendingToInsert = newAssignments
+      .filter((a) => a.round >= currentRound)
+      .map((a) => ({
+        ...a,
+        _id: `assign_r${a.round}_t${a.teamId}_g${a.gameId}_v${Date.now()}_${Math.random().toString(36).substring(7)}`,
+      }));
+    if (pendingToInsert.length > 0) {
+      await GameAssignmentModel.insertMany(pendingToInsert);
+    }
+  } else {
+    targetGame = store.games.find((g) => g._id === gameId || `game_${g.gameNumber}` === gameId);
+    if (!targetGame) throw new Error("Game not found");
+
+    targetGame.inRotation = !targetGame.inRotation;
+    allGames = store.games;
+    allTeams = store.teams;
+    currentRound = store.eventState.currentRound;
+
+    const newAssignments = generateStationRotation(allTeams, allGames, 9);
+    store.assignments = [
+      ...store.assignments.filter((a) => a.round < currentRound),
+      ...newAssignments.filter((a) => a.round >= currentRound),
+    ];
+  }
+
+  const actionStatus = targetGame.inRotation ? "UNFROZEN" : "FROZEN";
+  await logAudit(
+    adminEmail,
+    `GAME_${actionStatus}`,
+    `Station #${targetGame.gameNumber} (${targetGame.name}) was ${actionStatus}. Rotation schedule updated.`
+  );
+
+  return targetGame;
+}
+
+// Admin: Import Students from Google Form CSV and Auto-Balance Teams
+export async function importStudentsAndBalance(
+  csvContent: string,
+  adminEmail: string,
+  desiredTeamCount: number = 9
+) {
+  const parsedStudents = parseStudentCSV(csvContent);
+  if (parsedStudents.length === 0) {
+    throw new Error("No valid student rows found in the uploaded CSV");
+  }
+
+  const conn = await connectMongo();
+  const store = getInMemoryStore();
+
+  const balancedTeams = balanceTeams(parsedStudents, desiredTeamCount);
+
+  if (conn) {
+    // Clean wipe of students and teams for a fresh sync
+    await Promise.all([
+      StudentModel.deleteMany({}),
+      TeamModel.deleteMany({}),
+      GameAssignmentModel.deleteMany({}),
+    ]);
+
+    await StudentModel.insertMany(parsedStudents);
+    await TeamModel.insertMany(balancedTeams);
+
+    const allGames = (await GameModel.find({}).lean()) as unknown as IGame[];
+    const assignments = generateStationRotation(balancedTeams, allGames, 9);
+    await GameAssignmentModel.insertMany(assignments);
+
+    // Reset round to 1
+    await EventStateModel.findOneAndUpdate({}, { currentRound: 1, phase: "RUNNING" });
+  } else {
+    store.students = parsedStudents.map((s, i) => ({ ...s, _id: `stud_${i + 1}` }));
+    store.teams = balancedTeams;
+    const assignments = generateStationRotation(balancedTeams, store.games, 9);
+    store.assignments = assignments;
+    store.eventState.currentRound = 1;
+    store.eventState.phase = "RUNNING";
+  }
+
+  const soloCount = parsedStudents.filter((s) => s.mode === "SOLO").length;
+  await logAudit(
+    adminEmail,
+    "IMPORT_CSV_AND_BALANCE",
+    `Imported ${parsedStudents.length} students (${soloCount} solo, ${parsedStudents.length - soloCount} team). Generated ${balancedTeams.length} balanced teams across 8 classes, equal A1/A2 and gender.`
+  );
+
+  return {
+    totalStudents: parsedStudents.length,
+    teamsCount: balancedTeams.length,
+    soloCount,
+    teams: balancedTeams,
+  };
 }
